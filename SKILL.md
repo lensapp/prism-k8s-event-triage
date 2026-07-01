@@ -95,16 +95,25 @@ cp "<this-skill-dir>/scripts/k8s-event-watcher.sh" /data/k8s-watcher/k8s-event-w
 chmod +x /data/k8s-watcher/k8s-event-watcher.sh
 ```
 
-Then `shell_spawn`:
+**Locate the kubeconfig first — do not rely on ambient env.** A spawned process doesn't
+inherit an interactive shell's un-exported `KUBECONFIG` or `kubectl` aliases, and in some
+sandboxes the kubeconfig is a runtime-written file not wired into the container env — so
+bare `kubectl` falls back to `localhost:8080`. Find the real path and pass it explicitly:
+
+```bash
+KUBECFG="${KUBECONFIG:-}"
+[ -z "$KUBECFG" ] && KUBECFG="$(find / -maxdepth 6 -type f \( -iname '*kubeconfig*' -o -path '*kube*config*' \) 2>/dev/null | head -1)"
+echo "using kubeconfig: ${KUBECFG:-<none found — kubectl will fail>}"
 ```
-bash /data/k8s-watcher/k8s-event-watcher.sh
+
+Then `shell_spawn` the watcher **pinned to that path**:
+```
+K8S_WATCHER_KUBECONFIG=<KUBECFG> bash /data/k8s-watcher/k8s-event-watcher.sh
 ```
 
 The watcher runs a **preflight** and exits immediately with a clear message if `kubectl`
-can't reach the cluster. If it reports `localhost:8080` refused, `kubectl` has no
-kubeconfig in the spawned process's context (a spawned process doesn't inherit an
-interactive shell's un-exported `KUBECONFIG` or `kubectl` aliases) — spawn it with an
-explicit path: `K8S_WATCHER_KUBECONFIG=/path/to/kubeconfig bash …/k8s-event-watcher.sh`.
+still can't reach the cluster (rather than looping) — if so, report the path problem to
+the user.
 
 Check whether it's already running: `pgrep -f k8s-event-watcher`. `<this-skill-dir>` is
 where this `SKILL.md` was loaded from (`find / -name k8s-event-watcher.sh 2>/dev/null | head -1`).
