@@ -19,14 +19,16 @@ kubectl watch (type=Warning) ──append──► /data/k8s-watcher/events.json
 - A lightweight background **watcher** (`scripts/k8s-event-watcher.sh`, spawned by
   the agent via `shell_spawn`) streams `Warning` events and appends each to a logfile
   on the persistent `/data` volume.
-- When events appear, the watcher — debounced — **schedules a one-shot "run now"
-  triage task** via the runtime's cron API (`POST /agents/cron-tasks`,
-  `schedule:"in 1 second"`).
-- When that task fires, the agent (driven by `SKILL.md`) reads the captured events and
-  triages the ongoing issue (root cause, severity, suggested action), then the one-shot
-  task auto-deletes.
+- A flusher checks the logfile every ~15s and, **only if it has content**, renames it to a
+  unique batch file and **schedules a one-shot triage task** for that batch via the runtime's
+  cron API (`POST /agents/cron-tasks`, `schedule:"in 1 minute"` — the runtime rejects
+  sub-minute one-shots). No content ⇒ no task, so there are no empty runs.
+- When the task fires, the agent (driven by `SKILL.md`) delegates the investigation to the
+  **`claude_code`** tool (plan/read-only mode), which reads the batch, follows the triage
+  runbook, and returns a report (root cause, severity, suggested fix). The one-shot task
+  then auto-deletes.
 
-Triage is **event-driven and real-time**: a task is scheduled only when real events
+Triage is **event-driven and near-real-time** (~1 min): a task is scheduled only when real events
 appear, so there are no empty/"all clear" runs, and the heartbeat is never touched.
 
 ## Install

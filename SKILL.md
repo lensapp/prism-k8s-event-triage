@@ -15,16 +15,21 @@ description: >-
 
 Real-time triage of Kubernetes `Warning` events — no webhooks, and **no heartbeat
 involvement**. A background **watcher** streams Warning events off the Kubernetes
-`watch` API, appends each to a logfile, and (debounced) **schedules a one-shot
-"run now" triage task** through the runtime's cron API. When that task fires, the
-agent — following Part A below — reads the captured events and triages the issue.
-Because a task is created only when real events appear, there are no empty/"all
-clear" runs to suppress.
+`watch` API and appends them to a logfile. Every ~15s a flusher checks the logfile: if
+(and only if) it has content, it renames it to a unique **batch file** and **schedules a
+one-shot "run now" triage task** for that batch through the runtime's cron API. When the
+task fires, the agent — following Part A — reads its batch and triages it.
+
+A task is scheduled **only when real events were captured**, and each task gets **its own
+batch file** — so there are no empty/"all clear" runs (nothing for the runtime to suppress)
+and no two tasks race over shared state.
 
 ```
-kubectl watch (type=Warning) ──append──► /data/k8s-watcher/events.jsonl
-        │ (debounced)                                  │ read when the task runs
-        └─ POST /agents/cron-tasks  (run-now one-shot) ─► triage task ─► triage ─► user
+kubectl watch (type=Warning) ──append──► events.jsonl
+                                             │  flush every ~15s, ONLY if non-empty
+                                             ▼  (atomic rename)
+                                         batch-<ts>.jsonl ──► POST /agents/cron-tasks
+                                                              (run-now one-shot) ──► triage task ──► triage ──► user
 ```
 
 ## Paths & config (defaults)
@@ -40,41 +45,49 @@ kubectl watch (type=Warning) ──append──► /data/k8s-watcher/events.json
 
 The watcher schedules a one-shot task whose instruction points here. On that run:
 
-### 1. Read the new events (atomic rotate — no growth, no races)
+### 1. Read your batch file
 
-The watcher appends with a fresh open each time, so renaming the file is race-free:
+Your triage task's instruction names a **batch file** under `/data/k8s-watcher/`
+(e.g. `/data/k8s-watcher/batch-<ts>.jsonl`). Read that exact path:
 
 ```bash
-if [ -s /data/k8s-watcher/events.jsonl ]; then
-  mv /data/k8s-watcher/events.jsonl /data/k8s-watcher/events.consuming
-  cat /data/k8s-watcher/events.consuming
-fi
+cat /data/k8s-watcher/batch-<ts>.jsonl   # exact path is in your instruction
 ```
 
-New events now flow into a fresh `events.jsonl`; `events.consuming` is yours to
-process. Each line is one event: `{ts, ns, kind, name, reason, type, count, message, uid}`.
-When done, `rm -f /data/k8s-watcher/events.consuming`. **If the file was empty
-(nothing to triage), reply with nothing** — the task makes no report.
+Each line is one event: `{ts, ns, kind, name, reason, type, count, message, uid}`. The
+watcher only schedules a task when the batch is non-empty, so you always have real events
+to triage — no need to guard for an empty file. When done, `rm -f` the batch file.
 
-### 2. Triage and report
+### 2. Triage via Claude Code
 
-**Read `references/triage-runbook.md` and follow it** — it has the full triage method,
-a severity rubric, a per-symptom playbook (CrashLoopBackOff, ImagePullBackOff, OOMKilled,
-FailedScheduling, FailedMount, probe Unhealthy, FailedCreate/quota, node pressure, HPA
-metric failures, …) with the exact diagnostic commands, likely causes, remediations, the
-output format, and safety rules. Essentials:
+Delegate the investigation to the **`claude_code`** tool — it runs in this workspace with
+the same `kubectl`/kubeconfig and can load this skill's runbook, and it's a far stronger
+multi-step investigator than a single inline turn. Use **`mode: "plan"`** (analyze, don't
+edit):
 
-- **Group** related events (same `involvedObject` / `reason`); triage the owning workload
-  (Pod → ReplicaSet → Deployment/Job/StatefulSet), not each raw line.
-- **Scope the blast radius** (one pod vs. whole workload vs. node vs. cluster) — it drives
-  severity more than the event count.
-- **Gather evidence** with `kubectl`: `describe` the object, current + `--previous` logs,
-  the object's recent events, `kubectl top` for resource pressure, node conditions.
-- **Report** per the runbook's format: what/where, severity, root-cause hypothesis (with
-  confidence + evidence), suggested immediate + durable fix, and what to watch.
-- **Safety:** default to read-only. Never run mutating commands (`delete`, `scale`,
-  `rollout restart`, `edit`, `apply`, `drain`, `patch`) without **explicit user
-  confirmation** — propose the exact command instead.
+```
+claude_code({
+  mode: "plan",
+  prompt: "Triage a Kubernetes incident. The captured Warning events are in <BATCH FILE>.
+    Read them, then follow the k8s-event-triage skill's references/triage-runbook.md:
+    group related events, scope the blast radius, and investigate the root cause with
+    READ-ONLY kubectl (describe / logs --previous / get events / top / node conditions).
+    Do NOT run any mutating command (delete/scale/rollout/edit/apply/drain/patch).
+    Return a concise report: what is failing, where (namespace/object), severity, the
+    root-cause hypothesis with evidence, and the suggested fix (as a command to PROPOSE,
+    not run)."
+})
+```
+
+Substitute the batch path from your instruction for `<BATCH FILE>`. Then poll
+`claude_code_status({ taskId })` until `completed` and **deliver its `result`** as the
+triage report. Keep the read-only rule in the prompt even though plan mode blocks file
+edits — plan mode does not by itself block mutating shell/`kubectl` commands.
+
+The full method, severity rubric, and per-symptom playbook (CrashLoopBackOff,
+ImagePullBackOff, OOMKilled, FailedScheduling, FailedMount, probe Unhealthy,
+FailedCreate/quota, node pressure, HPA metric failures, …) live in
+`references/triage-runbook.md` — that's what Claude Code follows.
 
 ---
 
@@ -82,7 +95,8 @@ output format, and safety rules. Essentials:
 
 The watcher (`scripts/k8s-event-watcher.sh`) streams `Warning` events, appends them to
 the logfile, and — debounced (default 15s) — POSTs a one-shot triage task to the cron API
-(`{name, schedule:"in 1 second", instruction}`). A burst of events collapses into a single
+(`{name, schedule:"in 1 minute", instruction}` — the runtime rejects sub-minute one-shots,
+so triage fires within ~1 min of a batch). A burst of events collapses into a single
 triage run; the task drains *all* accumulated lines when it fires.
 
 **(Re)start it via the `shell_spawn` tool** (NOT `shell_exec` — it must outlive the turn).
